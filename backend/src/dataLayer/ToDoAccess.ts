@@ -1,110 +1,159 @@
-import * as AWS from "aws-sdk";
-import { DocumentClient } from "aws-sdk/clients/dynamodb";
-import { Types } from 'aws-sdk/clients/s3';
-import { TodoItem } from "../models/TodoItem";
-import { TodoUpdate } from "../models/TodoUpdate";
+import * as AWS from 'aws-sdk';
+import * as AWSXRay from 'aws-xray-sdk'
+import { DocumentClient } from 'aws-sdk/clients/dynamodb';
+import { TodoItem } from '../models/TodoItem';
+import { TodoUpdate } from '../models/TodoUpdate';
 
+const XAWS = AWSXRay.captureAWS(AWS)
 
-export class ToDoAccess {
+const s3 = new XAWS.S3({
+    signatureVersion: 'v4'
+})
+
+export default class TodosAccess {
+
     constructor(
-        private readonly docClient: DocumentClient = new AWS.DynamoDB.DocumentClient(),
-        private readonly s3Client: Types = new AWS.S3({ signatureVersion: 'v4' }),
-        private readonly todoTable = process.env.TODOS_TABLE,
-        private readonly s3BucketName = process.env.S3_BUCKET_NAME) {
+        private readonly docClient: DocumentClient = createDynamoDBClient(),
+        private readonly todosTable = process.env.TODOS_TABLE,
+        private readonly userIdIndex = process.env.USER_ID_INDEX,
+        private readonly bucketName = process.env.ATTACHMENT_IMAGES_S3_BUCKET,
+        private readonly urlExpiration = process.env.SIGNED_URL_EXPIRATION) {
     }
 
-    async getAllToDo(userId: string): Promise<TodoItem[]> {
-        console.log("Getting all todo");
+    async getAllTodosForUser(userId: string): Promise<TodoItem[]> {
+        console.log(`Getting all todos for user ${userId}`)
 
-        const params = {
-            TableName: this.todoTable,
-            KeyConditionExpression: "#userId = :userId",
-            ExpressionAttributeNames: {
-                "#userId": "userId"
-            },
+        const result = await this.docClient.query({
+            TableName: this.todosTable,
+            IndexName: this.userIdIndex,
+            KeyConditionExpression: 'userId = :userId',
             ExpressionAttributeValues: {
-                ":userId": userId
+                ':userId': userId
             }
-        };
+        }).promise()
 
-        const result = await this.docClient.query(params).promise();
-        console.log(result);
         const items = result.Items;
-
         return items as TodoItem[];
     }
 
-    async createToDo(todoItem: TodoItem): Promise<TodoItem> {
-        console.log("Creating new todo");
+    async createTodo(todoItem: TodoItem): Promise<TodoItem> {
+        await this.docClient.put({
+            TableName: this.todosTable,
+            Item: todoItem
+        }).promise();
 
-        const params = {
-            TableName: this.todoTable,
-            Item: todoItem,
-        };
-
-        const result = await this.docClient.put(params).promise();
-        console.log(result);
-
-        return todoItem as TodoItem;
+        return todoItem;
     }
 
-    async updateToDo(todoUpdate: TodoUpdate, todoId: string, userId: string): Promise<TodoUpdate> {
-        console.log("Updating todo");
+
+    async updateTodo(todoId: string, updateTodoItem: TodoUpdate): Promise<void> {
+        // form the update expression and the expression attribute values
+        let updateExpression = '';
+        const expressionAttributeValues = {};
+        const expressionAttributeNames = {};
+
+        if (updateTodoItem.name) {
+            updateExpression = 'SET #name =:n';
+            expressionAttributeValues[':n'] = updateTodoItem.name;
+            expressionAttributeNames["#name"] = "name";
+        }
+
+        if (updateTodoItem.dueDate) {
+            const dueDateTimestamp = Date.parse(updateTodoItem.dueDate);
+            updateExpression = `${updateExpression}, #dueDate =:d`;
+            expressionAttributeValues[':d'] = new Date(dueDateTimestamp).toISOString();
+            expressionAttributeNames["#dueDate"] = "dueDate";
+        }
+
+        if (updateTodoItem.done) {
+            updateExpression = `${updateExpression}, #done =:do`;
+            expressionAttributeValues[':do'] = updateTodoItem.done;
+            expressionAttributeNames["#done"] = "done";
+        }
+
+        if (updateExpression === '') {
+            throw {
+                status: 404,
+                error: new Error("TODO does not exist")
+            }
+        }
 
         const params = {
-            TableName: this.todoTable,
+            TableName: this.todosTable,
             Key: {
-                "userId": userId,
-                "todoId": todoId
+                todoId: todoId
             },
-            UpdateExpression: "set #a = :a, #b = :b, #c = :c",
-            ExpressionAttributeNames: {
-                "#a": "name",
-                "#b": "dueDate",
-                "#c": "done"
-            },
-            ExpressionAttributeValues: {
-                ":a": todoUpdate['name'],
-                ":b": todoUpdate['dueDate'],
-                ":c": todoUpdate['done']
-            },
-            ReturnValues: "ALL_NEW"
+            UpdateExpression: updateExpression,
+            ExpressionAttributeNames: expressionAttributeNames,
+            ExpressionAttributeValues: expressionAttributeValues,
+            ReturnValues: 'UPDATED_NEW'
         };
 
-        const result = await this.docClient.update(params).promise();
-        console.log(result);
-        const attributes = result.Attributes;
-
-        return attributes as TodoUpdate;
+        await this.docClient.update(params).promise();
     }
 
-    async deleteToDo(todoId: string, userId: string): Promise<string> {
-        console.log("Deleting todo");
-
+    async deleteTodo(todoId: string): Promise<void> {
         const params = {
-            TableName: this.todoTable,
+            TableName: this.todosTable,
             Key: {
-                "userId": userId,
-                "todoId": todoId
+                todoId: todoId
             },
+            ReturnValues: 'ALL_OLD'
+        };
+        await this.docClient.delete(params).promise();
+    }
+
+    async generateUploadUrl(todoId: string, imageId: string): Promise<string> {
+        const params = {
+            TableName: this.todosTable,
+            Key: {
+                todoId: todoId
+            },
+            UpdateExpression: 'SET #attachmentUrl =:url',
+            ExpressionAttributeNames: { "#attachmentUrl": "attachmentUrl" },
+            ExpressionAttributeValues: { ":url": `https://${this.bucketName}.s3.amazonaws.com/${imageId}` },
+            ReturnValues: 'UPDATED_NEW'
         };
 
-        const result = await this.docClient.delete(params).promise();
-        console.log(result);
-
-        return "" as string;
+        // update the db with the get url for the image before sending out the 
+        // upload url
+        await this.docClient.update(params).promise();
+        const url = this.getUploadUrl(imageId);
+        return url;
     }
 
-    async generateUploadUrl(todoId: string): Promise<string> {
-        console.log("Generating URL");
+    async todoExists(todoId: string) {
+        const result = await this.docClient
+            .get({
+                TableName: this.todosTable,
+                Key: {
+                    todoId,
+                }
+            })
+            .promise()
+        console.log('Get Todo: ', result)
+        return !!result.Item
 
-        const url = this.s3Client.getSignedUrl('putObject', {
-            Bucket: this.s3BucketName,
-            Key: todoId,
-            Expires: 1000,
-        });
-        console.log(url);
-
-        return url as string;
     }
+
+    async getUploadUrl(imageId: string) {
+        return s3.getSignedUrl('putObject', {
+            Bucket: this.bucketName,
+            Key: imageId,
+            Expires: this.urlExpiration
+        })
+    }
+
+}
+
+function createDynamoDBClient() {
+    if (process.env.IS_OFFLINE) {
+        console.log('Creating a local DynamoDB instance')
+        return new AWS.DynamoDB.DocumentClient({
+            region: 'localhost',
+            endpoint: 'http://localhost:8000'
+        })
+    }
+
+    return new XAWS.DynamoDB.DocumentClient()
 }
